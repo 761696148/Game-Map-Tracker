@@ -1,5 +1,5 @@
 {
-    "latest_version": "2.0.0",
+    "latest_version": "3.0.0",
     "download_url": "https://pan.quark.cn/s/77187998676b?pwd=XuA4",
-    "release_notes": "【v2.0.0 更新日志】\n1. 优化：彻底切断PyTorch依赖，内存占用大幅下降。\n2. 修复：Windows缩放不为100%时选点框错位的问题。\n3. 新增：雷达丢失后的画面文字提示功能。\n4. 新增：更新检测机制。"
+    "release_notes": "【v3.0.0 更新日志】\n1. 优化：彻底切断PyTorch依赖，内存占用大幅下降。\n2. 修复：Windows缩放不为100%时选点框错位的问题。\n3. 新增：雷达丢失后的画面文字提示功能。\n4. 新增：更新检测机制。"
 }
