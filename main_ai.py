@@ -11,6 +11,7 @@ import sys
 import subprocess
 import threading
 import time
+import random
 import ctypes
 from ctypes import windll
 from pynput import keyboard
@@ -208,8 +209,10 @@ class AIMapTrackerApp:
         # 🌟 设置初始透明度（0.8 表示 80% 不透明）
         self.root.attributes("-alpha", 0.8)
 
-        # 获取初始窗口大小
-        self.root.geometry(config.WINDOW_GEOMETRY)
+        # 水平居中，垂直 +100
+        _w, _h = map(int, config.WINDOW_GEOMETRY.split("x"))
+        _x = (self.root.winfo_screenwidth() - _w) // 2
+        self.root.geometry(f"{_w}x{_h}+{_x}+100")
 
         # --- 1. 基础变量初始化 (必须最先定义) ---
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -221,7 +224,7 @@ class AIMapTrackerApp:
         self.display_map_bgr = cv2.imread(config.DISPLAY_MAP_PATH)
 
         # 状态机与追踪变量
-        self.state = "MANUAL_RELOCATE"
+        self.state = "LOST"
         self.last_x, self.last_y = self.map_width // 2, self.map_height // 2
         self.base_search_radius = config.AI_TRACK_RADIUS
         self.current_search_radius = self.base_search_radius
@@ -235,6 +238,20 @@ class AIMapTrackerApp:
         # 动态视图尺寸变量
         self.view_w = 400
         self.view_h = 400
+
+        # 全图扫描状态
+        self._scan_tiles = None       # 待扫描瓦片列表，None 表示尚未初始化
+        self._scan_idx = 0            # 当前扫描到第几块
+        self._scan_progress = (0, 0)  # (已扫描数, 总数) 供 UI 显示
+
+        # 拖拽 / 缩放 状态
+        self.pan_dx = 0.0        # 屏幕像素偏移量（正值 = 视图向右平移，玩家向左偏）
+        self.pan_dy = 0.0
+        self.zoom = 1.0          # 缩放倍数（>1 放大，<1 缩小）
+        self._is_user_panned = False  # 用户是否手动平移过（用于触发自动复位）
+        self._pan_origin = (0, 0)     # 开始拖拽时玩家所在位置（用于判断是否移动足够远）
+        self._drag_x = 0
+        self._drag_y = 0
 
         # --- 2. 核心模块实例化 ---
         self.engine = LoftrEngine(self.device)
@@ -290,9 +307,16 @@ class AIMapTrackerApp:
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.image_on_canvas = None
 
-        # E. 重新选点按钮
-        tk.Button(self.main_frame, text="重新选点", command=self.trigger_manual_relocate,
-                  bg="#4CAF50", fg="white", font=("微软雅黑", 9, "bold"), relief=tk.FLAT).place(x=5, y=5)
+        # E. 手动选点 / 自动定位 按钮
+        tk.Button(self.main_frame, text="手动选点", command=self.trigger_manual_relocate,
+                                    bg="#4CAF50", fg="white", font=("微软雅黑", 9, "bold"), relief=tk.FLAT).place(relx=1.0, x=-5, y=5, anchor="ne")
+        tk.Button(self.main_frame, text="自动定位", command=self.trigger_global_scan,
+                                  bg="#2196F3", fg="white", font=("微软雅黑", 9, "bold"), relief=tk.FLAT).place(relx=1.0, x=-85, y=5, anchor="ne")
+
+        # F. 地图拖拽 / 缩放事件
+        self.canvas.bind("<ButtonPress-1>", self._on_pan_start)
+        self.canvas.bind("<B1-Motion>", self._on_pan_move)
+        self.canvas.bind("<MouseWheel>", self._on_zoom)
 
         # --- 4. 事件绑定 ---
         self.root.bind("<Configure>", self.on_window_resize)
@@ -306,6 +330,36 @@ class AIMapTrackerApp:
         self.ai_thread = threading.Thread(target=self.ai_worker_loop, daemon=True)
         self.ai_thread.start()
         self.ui_render_loop()
+
+    def _on_pan_start(self, event):
+        """记录拖拽起始点，同时记录当前玩家位置作为自动复位基准"""
+        self._drag_x = event.x
+        self._drag_y = event.y
+        if not self._is_user_panned:
+            self._pan_origin = (self.last_x, self.last_y)
+
+    def _on_pan_move(self, event):
+        """拖拽平移地图"""
+        dx = event.x - self._drag_x
+        dy = event.y - self._drag_y
+        self._drag_x = event.x
+        self._drag_y = event.y
+        self.pan_dx += dx
+        self.pan_dy += dy
+        self._is_user_panned = True
+
+    def _on_zoom(self, event):
+        """滚轮缩放，以鼠标位置为中心"""
+        factor = 1.15 if event.delta > 0 else 1 / 1.15
+        new_zoom = max(0.25, min(5.0, self.zoom * factor))
+        # 保持鼠标指向的地图点不动：推导出新的 pan 偏移
+        cx, cy = self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2
+        ex, ey = event.x - cx, event.y - cy
+        ratio = new_zoom / self.zoom
+        self.pan_dx = ex - (ex - self.pan_dx) * ratio
+        self.pan_dy = ey - (ey - self.pan_dy) * ratio
+        self.zoom = new_zoom
+        self._is_user_panned = True
 
     def start_hotkey_listener(self):
         """在独立线程中监听全局热键"""
@@ -399,9 +453,32 @@ class AIMapTrackerApp:
         self.route_mgr.visibility[name] = new_state
         print(f"路线 [{name}] 显示状态修改为: {new_state}")
 
+    def _generate_scan_tiles(self):
+        """生成覆盖全图的瓦片列表，随机打乱顺序以提升平均定位速度"""
+        size = config.AI_SCAN_SIZE
+        step = config.AI_SCAN_STEP
+        tiles = []
+        y = 0
+        while y < self.map_height:
+            x = 0
+            while x < self.map_width:
+                x2 = min(x + size, self.map_width)
+                y2 = min(y + size, self.map_height)
+                if x2 - x >= 32 and y2 - y >= 32:
+                    tiles.append((x, y, x2, y2))
+                x += step
+            y += step
+        random.shuffle(tiles)
+        return tiles
+
     def trigger_manual_relocate(self):
+        self._scan_tiles = None
         self.selector_open = False  # 强制重置一次标志位，确保能打开
         self.state = "MANUAL_RELOCATE"
+
+    def trigger_global_scan(self):
+        self._scan_tiles = None
+        self.state = "GLOBAL_SCAN"
 
         # 🌟 新增：处理选点窗口关闭时的回调
     def reset_selector_flag(self):
@@ -435,12 +512,72 @@ class AIMapTrackerApp:
                     time.sleep(0.1)
                     continue
 
+                # 1b. 全图雷达扫描
+                if self.state == "GLOBAL_SCAN":
+                    if self._scan_tiles is None:
+                        self._scan_tiles = self._generate_scan_tiles()
+                        self._scan_idx = 0
+                        self._scan_progress = (0, len(self._scan_tiles))
+                        print(f"🔍 开始全图扫描，共 {len(self._scan_tiles)} 块瓦片")
+
+                    if self._scan_idx >= len(self._scan_tiles):
+                        # 全图扫完未找到，重新洗牌再扫
+                        print("⚠️ 全图扫描未找到匹配，重新扫描...")
+                        self._scan_tiles = None
+                        time.sleep(0.5)
+                        continue
+
+                    try:
+                        screenshot = sct.grab(self.minimap_region)
+                        scan_mini = np.array(screenshot)[:, :, :3]
+                    except Exception as e:
+                        print(f"截图失败: {e}")
+                        time.sleep(0.1)
+                        continue
+
+                    tx1, ty1, tx2, ty2 = self._scan_tiles[self._scan_idx]
+                    self._scan_idx += 1
+                    self._scan_progress = (self._scan_idx, len(self._scan_tiles))
+
+                    tile = self.logic_map_bgr[ty1:ty2, tx1:tx2]
+                    if tile.shape[0] < 32 or tile.shape[1] < 32:
+                        continue
+
+                    t_mini = self.engine.preprocess(scan_mini)
+                    t_tile = self.engine.preprocess(tile)
+                    corr = self.engine.match(t_mini, t_tile)
+                    mk0 = corr['keypoints0'].cpu().numpy()
+                    mk1 = corr['keypoints1'].cpu().numpy()
+                    conf = corr['confidence'].cpu().numpy()
+
+                    v_idx = conf > config.AI_CONFIDENCE_THRESHOLD
+                    mk0f, mk1f = mk0[v_idx], mk1[v_idx]
+
+                    # 全局扫描要求更严格：匹配点数翻倍 + RANSAC 内点比率 > 50%
+                    min_matches = max(config.AI_MIN_MATCH_COUNT * 2, 15)
+                    if len(mk0f) >= min_matches:
+                        M, inliers = cv2.findHomography(mk0f, mk1f, cv2.RANSAC, config.AI_RANSAC_THRESHOLD)
+                        if M is not None and inliers is not None and inliers.sum() / len(mk0f) > 0.5:
+                            h, w = scan_mini.shape[:2]
+                            center = cv2.perspectiveTransform(np.float32([[[w / 2, h / 2]]]), M)
+                            rx, ry = center[0][0][0] + tx1, center[0][0][1] + ty1
+                            if 0 <= rx < self.map_width and 0 <= ry < self.map_height:
+                                self.last_x, self.last_y = int(rx), int(ry)
+                                self.smoothed_cx, self.smoothed_cy = rx, ry
+                                self.lost_frames = 0
+                                self.current_search_radius = self.base_search_radius
+                                total = len(self._scan_tiles)
+                                self._scan_tiles = None
+                                self.state = "LOCAL_TRACK"
+                                print(f"✅ 全局扫描定位成功: ({int(rx)}, {int(ry)})，扫描了 {self._scan_idx}/{total} 块")
+                    continue
+
                 start_time = time.time()
 
                 # 2. 获取当前窗口实时尺寸 (由主线程 Configure 事件更新)
                 # 使用局部变量防止计算过程中尺寸突变导致数组越界
-                current_vw = self.view_w
-                current_vh = self.view_h
+                current_vw = self.canvas.winfo_width()
+                current_vh = self.canvas.winfo_height()
                 half_vw = current_vw // 2
                 half_vh = current_vh // 2
 
@@ -495,42 +632,89 @@ class AIMapTrackerApp:
 
                 # 6. 状态维护
                 if found:
-                    self.last_x, self.last_y = int(self.smoothed_cx), int(self.smoothed_cy)
+                    new_x, new_y = int(self.smoothed_cx), int(self.smoothed_cy)
+                    if self._is_user_panned:
+                        ox, oy = self._pan_origin
+                        moved = abs(new_x - ox) + abs(new_y - oy)
+                        if moved > 5:
+                            self.pan_dx = 0.0
+                            self.pan_dy = 0.0
+                            self.zoom = 1.0
+                            self._is_user_panned = False
+                    self.last_x, self.last_y = new_x, new_y
                     self.lost_frames, self.current_search_radius = 0, self.base_search_radius
+                    if self.state == "LOST":
+                        self.state = "LOCAL_TRACK"
                 else:
                     self.lost_frames += 1
                     if self.lost_frames == 1:
                         self.current_search_radius += 300  # 丢失首帧扩大搜索圈
-                    if self.lost_frames > self.max_lost_frames:
-                        self.state = "MANUAL_RELOCATE"
+                    if self.lost_frames > self.max_lost_frames and self.state == "LOCAL_TRACK":
+                        self.state = "LOST"
 
-                # 7. 动态渲染裁剪 (核心修改：使用窗口实时宽高)
-                vx1, vy1 = max(0, self.last_x - half_vw), max(0, self.last_y - half_vh)
-                vx2, vy2 = min(self.map_width, self.last_x + half_vw), min(self.map_height, self.last_y + half_vh)
+                # 7. 动态渲染裁剪（支持 pan + zoom，边缘不拉伸）
+                zoom = self.zoom
+                pan_dx = self.pan_dx
+                pan_dy = self.pan_dy
 
-                # 裁剪展示用大地图
-                crop = self.display_map_bgr[vy1:vy2, vx1:vx2].copy()
+                # 视图在地图坐标系中覆盖的像素数
+                map_w = max(1, int(current_vw / zoom))
+                map_h = max(1, int(current_vh / zoom))
 
-                # 8. 绘制路线 (传递动态窗口尺寸以适配绘制逻辑)
-                # 这里假设 RouteManager.draw_on 的最后一个参数改为最大边长或自适应
-                # 传入 self.last_x 和 self.last_y 作为人物当前位置
-                self.route_mgr.draw_on(crop, vx1, vy1, max(current_vw, current_vh), self.last_x, self.last_y)
+                # 裁剪中心（玩家位置 + 平移偏移转换到地图坐标）
+                crop_cx = int(self.last_x - pan_dx / zoom)
+                crop_cy = int(self.last_y - pan_dy / zoom)
 
-                # 9. 绘制玩家箭头 (原生小地图箭头抠图)
-                mh, mw = mini_bgr.shape[:2]
-                asize = 12
-                # 提取小地图中心的箭头
-                arrow = mini_bgr[mh // 2 - asize: mh // 2 + asize, mw // 2 - asize: mw // 2 + asize].copy()
+                # 期望的裁剪范围（可能超出地图边界）
+                desired_x1 = crop_cx - map_w // 2
+                desired_y1 = crop_cy - map_h // 2
+                desired_x2 = desired_x1 + map_w
+                desired_y2 = desired_y1 + map_h
 
-                # 计算箭头在 crop 上的局部坐标
-                ay_local, ax_local = self.last_y - vy1 - asize, self.last_x - vx1 - asize
+                # 实际可裁剪范围（地图边界内）
+                vx1 = max(0, desired_x1)
+                vy1 = max(0, desired_y1)
+                vx2 = min(self.map_width, desired_x2)
+                vy2 = min(self.map_height, desired_y2)
 
-                # 检查边界防止绘制越界
-                if 0 <= ay_local < crop.shape[0] - 2 * asize and 0 <= ax_local < crop.shape[1] - 2 * asize:
-                    roi = crop[ay_local: ay_local + 2 * asize, ax_local: ax_local + 2 * asize]
-                    # 透明度融合
-                    crop[ay_local: ay_local + 2 * asize, ax_local: ax_local + 2 * asize] = \
-                        cv2.addWeighted(arrow, 0.8, roi, 0.2, 0)
+                # 准备黑色背景画布（边缘超出地图时显示黑色而非拉伸）
+                frame = np.zeros((current_vh, current_vw, 3), dtype=np.uint8)
+
+                if vx2 > vx1 and vy2 > vy1:
+                    part = self.display_map_bgr[vy1:vy2, vx1:vx2].copy()
+
+                    # 8. 绘制路线（坐标基于原始地图像素）
+                    self.route_mgr.draw_on(part, vx1, vy1, max(current_vw, current_vh), self.last_x, self.last_y)
+
+                    # 9. 绘制玩家箭头
+                    mh, mw = mini_bgr.shape[:2]
+                    asize = 12
+                    arrow = mini_bgr[mh // 2 - asize: mh // 2 + asize, mw // 2 - asize: mw // 2 + asize].copy()
+                    ay_local = self.last_y - vy1 - asize
+                    ax_local = self.last_x - vx1 - asize
+                    if 0 <= ay_local < part.shape[0] - 2 * asize and 0 <= ax_local < part.shape[1] - 2 * asize:
+                        roi = part[ay_local: ay_local + 2 * asize, ax_local: ax_local + 2 * asize]
+                        part[ay_local: ay_local + 2 * asize, ax_local: ax_local + 2 * asize] = \
+                            cv2.addWeighted(arrow, 0.8, roi, 0.2, 0)
+
+                    # 将 part 缩放到 canvas 像素尺寸，再贴到黑色背景的正确位置
+                    scaled_w = int((vx2 - vx1) * zoom)
+                    scaled_h = int((vy2 - vy1) * zoom)
+                    if scaled_w > 0 and scaled_h > 0:
+                        interp = cv2.INTER_LINEAR if zoom >= 1 else cv2.INTER_AREA
+                        part_scaled = cv2.resize(part, (scaled_w, scaled_h), interpolation=interp)
+
+                        # 计算在 canvas 上的起始位置
+                        dst_x = int((vx1 - desired_x1) * zoom)
+                        dst_y = int((vy1 - desired_y1) * zoom)
+                        dst_x2 = min(dst_x + scaled_w, current_vw)
+                        dst_y2 = min(dst_y + scaled_h, current_vh)
+                        src_w = dst_x2 - dst_x
+                        src_h = dst_y2 - dst_y
+                        if src_w > 0 and src_h > 0:
+                            frame[dst_y:dst_y2, dst_x:dst_x2] = part_scaled[:src_h, :src_w]
+
+                crop = frame
 
                 # 10. 放入共享变量供主线程 Canvas 渲染
                 with self.lock:
@@ -542,11 +726,28 @@ class AIMapTrackerApp:
 
     def ui_render_loop(self):
         """主线程渲染循环 - 支持动态窗口缩放"""
-        # 获取当前画布的实时尺寸
-        current_vw = self.view_w
-        current_vh = self.view_h
+        if self.state == "GLOBAL_SCAN":
+            draw_w = max(self.canvas.winfo_width(), 100)
+            draw_h = max(self.canvas.winfo_height(), 100)
+            # 以上次已知地图画面为底图（若有），叠加半透明遮罩
+            with self.lock:
+                base = self.latest_display_crop.copy() if self.latest_display_crop is not None \
+                    else np.zeros((draw_h, draw_w, 3), np.uint8)
+            if base.shape[0] != draw_h or base.shape[1] != draw_w:
+                base = cv2.resize(base, (draw_w, draw_h))
+            dark = np.zeros_like(base)
+            base = cv2.addWeighted(base, 0.35, dark, 0.65, 0)
+            cur, total = self._scan_progress
+            lines = ["Scanning map...", f"{cur} / {total}" if total > 0 else "Preparing..."]
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            for i, text in enumerate(lines):
+                ts = cv2.getTextSize(text, font, 0.6, 2)[0]
+                tx = (draw_w - ts[0]) // 2
+                ty = draw_h // 2 - 10 + i * 28
+                cv2.putText(base, text, (tx, ty), font, 0.6, (0, 200, 255), 2)
+            self._render_to_canvas(base)
 
-        if self.state == "MANUAL_RELOCATE":
+        elif self.state == "MANUAL_RELOCATE":
             if not self.selector_open:
                 self.selector_open = True
                 torch.cuda.empty_cache()
@@ -559,11 +760,25 @@ class AIMapTrackerApp:
                     self.route_mgr,  # 🌟 传路线管理器
                     self.check_vars  # 🌟 传多选框状态，实现内外同步
                 )
+            self._render_waiting()
 
-            # 🌟 修改：创建一个匹配当前窗口尺寸的黑色背景提示图
-            # 防止视图尺寸为0时报错
-            draw_w = max(current_vw, 100)
-            draw_h = max(current_vh, 100)
+        elif self.state == "LOST":
+            # 目标丢失：显示等待提示
+            self._render_waiting()
+
+        else:
+            # 正常追踪状态
+            with self.lock:
+                if self.latest_display_crop is not None:
+                    # 直接渲染 AI 线程根据窗口尺寸裁剪好的画面
+                    self._render_to_canvas(self.latest_display_crop)
+
+        # 保持约 33 FPS 的刷新率
+        self.root.after(30, self.ui_render_loop)
+
+    def _render_waiting(self):
+            draw_w = max(self.canvas.winfo_width(), 100)
+            draw_h = max(self.canvas.winfo_height(), 100)
 
             blank = np.zeros((draw_h, draw_w, 3), np.uint8)
 
@@ -578,16 +793,6 @@ class AIMapTrackerApp:
 
             cv2.putText(blank, text, (text_x, text_y), font, font_scale, (0, 165, 255), thickness)
             self._render_to_canvas(blank)
-
-        else:
-            # 正常追踪状态
-            with self.lock:
-                if self.latest_display_crop is not None:
-                    # 直接渲染 AI 线程根据窗口尺寸裁剪好的画面
-                    self._render_to_canvas(self.latest_display_crop)
-
-        # 保持约 33 FPS 的刷新率
-        self.root.after(30, self.ui_render_loop)
 
     def _render_to_canvas(self, crop):
         rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
