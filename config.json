@@ -1,14 +1,14 @@
 {
     "MINIMAP": {
-        "top": 309,
-        "left": 1837,
+        "top": 181,
+        "left": 2110,
         "width": 180,
         "height": 180
     },
-    "WINDOW_GEOMETRY": "700x350+1500+100",
+    "WINDOW_GEOMETRY": "700x350",
     "VIEW_SIZE": 400,
-    "LOGIC_MAP_PATH": "big_map.png",
-    "DISPLAY_MAP_PATH": "big_map-1.png",
+    "LOGIC_MAP_PATH": "test_map_z12.png",
+    "DISPLAY_MAP_PATH": "test_map_z12.png",
     "MAX_LOST_FRAMES": 50,
     "SIFT_REFRESH_RATE": 50,
     "SIFT_CLAHE_LIMIT": 3.0,
